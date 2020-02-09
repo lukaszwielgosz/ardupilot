@@ -21,18 +21,14 @@
 #include "AP_WindVane_Airspeed.h"
 #include "AP_WindVane_RPM.h"
 #include "AP_WindVane_SITL.h"
-
-#define WINDVANE_DEFAULT_PIN 15                     // default wind vane sensor analog pin
-#define WINDSPEED_DEFAULT_SPEED_PIN 14              // default pin for reading speed from ModernDevice rev p wind sensor
-#define WINDSPEED_DEFAULT_TEMP_PIN 13               // default pin for reading temperature from ModernDevice rev p wind sensor
-#define WINDSPEED_DEFAULT_VOLT_OFFSET 1.346         // default voltage offset between speed and temp pins from ModernDevice rev p wind sensor
+#include "AP_WindVane_NMEA.h"
 
 const AP_Param::GroupInfo AP_WindVane::var_info[] = {
 
     // @Param: TYPE
     // @DisplayName: Wind Vane Type
     // @Description: Wind Vane type
-    // @Values: 0:None,1:Heading when armed,2:RC input offset heading when armed,3:Analog
+    // @Values: 0:None,1:Heading when armed,2:RC input offset heading when armed,3:Analog,4:NMEA,10:SITL
     // @User: Standard
     // @RebootRequired: True
     AP_GROUPINFO_FLAGS("TYPE", 1, AP_WindVane, _direction_type, 0, AP_PARAM_FLAG_ENABLE),
@@ -114,7 +110,7 @@ const AP_Param::GroupInfo AP_WindVane::var_info[] = {
     // @Param: SPEED_TYPE
     // @DisplayName: Wind speed sensor Type
     // @Description: Wind speed sensor type
-    // @Values: 0:None,1:Airspeed library,2:Modern Devices Wind Sensor,3:RPM library,10:SITL
+    // @Values: 0:None,1:Airspeed library,2:Modern Devices Wind Sensor,3:RPM library,4:NMEA,10:SITL
     // @User: Standard
     // @RebootRequired: True
     AP_GROUPINFO("SPEED_TYPE", 11, AP_WindVane, _speed_sensor_type,  0),
@@ -178,10 +174,16 @@ bool AP_WindVane::enabled() const
     return _direction_type != WINDVANE_NONE;
 }
 
-// Initialize the Wind Vane object and prepare it for use
-void AP_WindVane::init()
+// return true if wind speed is enabled
+bool AP_WindVane::wind_speed_enabled() const
 {
-    // don't init twice
+    return (_speed_sensor_type != WINDSPEED_NONE);
+}
+
+// Initialize the Wind Vane object and prepare it for use
+void AP_WindVane::init(const AP_SerialManager& serial_manager)
+{
+    // don't construct twice
     if (_direction_driver != nullptr || _speed_driver != nullptr ) {
         return;
     }
@@ -203,6 +205,10 @@ void AP_WindVane::init()
             _direction_driver = new AP_WindVane_SITL(*this);
 #endif
             break;
+        case WindVaneType::WINDVANE_NMEA:
+            _direction_driver = new AP_WindVane_NMEA(*this);
+            _direction_driver->init(serial_manager);
+            break;
     }
 
     // wind speed
@@ -218,12 +224,21 @@ void AP_WindVane::init()
         case Speed_type::WINDSPEED_SITL:
 #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
             // single driver does both speed and direction
-            if (_direction_type != WINDVANE_SITL) {
+            if (_direction_type != WindVaneType::WINDVANE_SITL) {
                 _speed_driver = new AP_WindVane_SITL(*this);
             } else {
                 _speed_driver = _direction_driver;
             }
 #endif
+            break;
+        case Speed_type::WINDSPEED_NMEA:
+            // single driver does both speed and direction
+            if (_direction_type != WindVaneType::WINDVANE_NMEA) {
+                _speed_driver = new AP_WindVane_NMEA(*this);
+                _speed_driver->init(serial_manager);
+            } else {
+                _speed_driver = _direction_driver;
+            }
             break;
         case Speed_type::WINDSPEED_RPM:
             _speed_driver = new AP_WindVane_RPM(*this);
@@ -273,7 +288,7 @@ void AP_WindVane::update()
         update_true_wind_speed_and_direction();
     } else {
         // no wind speed sensor, so can't do true wind calcs
-        _direction_absolute = _direction_apparent_ef;
+        _direction_true = _direction_apparent_ef;
         _speed_true = 0.0f;
         return;
     }
@@ -311,7 +326,7 @@ void AP_WindVane::send_wind(mavlink_channel_t chan)
     // send wind
     mavlink_msg_wind_send(
         chan,
-        wrap_360(degrees(get_absolute_wind_direction_rad())),
+        wrap_360(degrees(get_true_wind_direction_rad())),
         get_true_wind_speed(),
         0);
 }
@@ -324,7 +339,7 @@ void AP_WindVane::update_true_wind_speed_and_direction()
     Vector3f veh_velocity;
     if (!AP::ahrs().get_velocity_NED(veh_velocity)) {
         // if no vehicle speed use apparent speed and direction directly
-        _direction_absolute = _direction_apparent_ef;
+        _direction_true = _direction_apparent_ef;
         _speed_true = _speed_apparent;
         return;
     }
@@ -337,7 +352,7 @@ void AP_WindVane::update_true_wind_speed_and_direction()
     Vector2f wind_true_vec = Vector2f(wind_apparent_vec.x + veh_velocity.x, wind_apparent_vec.y + veh_velocity.y);
 
     // calculate true speed and direction
-    _direction_absolute = wrap_PI(atan2f(wind_true_vec.y, wind_true_vec.x) - radians(180));
+    _direction_true = wrap_PI(atan2f(wind_true_vec.y, wind_true_vec.x) - radians(180));
     _speed_true = wind_true_vec.length();
 }
 
